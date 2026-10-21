@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudpulse-worker-metrics
+  namespace: cloudpulse
+  labels: {app: cloudpulse-worker-metrics}
+spec:
+  selector: {app: cloudpulse-worker}
+  ports: [{name: metrics, port: 9100, targetPort: 9100}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: cloudpulse
+data:
+  prometheus.yml: |
+    global: {scrape_interval: 5s}
+    scrape_configs:
+      - job_name: cloudpulse-api
+        metrics_path: /metrics/
+        static_configs: [{targets: ['cloudpulse-api:80']}]
+      - job_name: cloudpulse-workers
+        static_configs: [{targets: ['cloudpulse-worker-metrics:9100']}]
+      - job_name: rabbitmq
+        static_configs: [{targets: ['rabbitmq:15692']}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: prometheus, namespace: cloudpulse}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: prometheus}}
+  template:
+    metadata: {labels: {app: prometheus}}
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args: [--config.file=/etc/prometheus/prometheus.yml, --storage.tsdb.path=/prometheus]
+          ports: [{containerPort: 9090}]
+          volumeMounts: [{name: config, mountPath: /etc/prometheus}]
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+      volumes: [{name: config, configMap: {name: prometheus-config}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: prometheus, namespace: cloudpulse}
+spec: {selector: {app: prometheus}, ports: [{port: 9090, targetPort: 9090}]}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-datasource, namespace: cloudpulse}
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: grafana-dashboard-provider, namespace: cloudpulse}
+data:
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: cloudpulse
+        folder: CloudPulse
+        type: file
+        options: {path: /var/lib/grafana/dashboards}
+  cloudpulse.json: |
+    {"title":"CloudPulse","uid":"cloudpulse","schemaVersion":39,"panels":[{"title":"API submit rate","type":"timeseries","targets":[{"expr":"sum(rate(cloudpulse_transactions_submitted_total[1m]))","legendFormat":"submits/s"}]},{"title":"API p95 submit latency","type":"timeseries","targets":[{"expr":"histogram_quantile(0.95, sum(rate(cloudpulse_submit_seconds_bucket[5m])) by (le))","legendFormat":"p95 seconds"}]},{"title":"Worker completion rate","type":"timeseries","targets":[{"expr":"sum(rate(cloudpulse_transactions_completed_total[1m]))","legendFormat":"completed/s"}]},{"title":"RabbitMQ ready messages","type":"timeseries","targets":[{"expr":"sum(rabbitmq_queue_messages_ready)","legendFormat":"queue depth"}]}]}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: grafana, namespace: cloudpulse}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grafana}}
+  template:
+    metadata: {labels: {app: grafana}}
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.4.0
+          env: [{name: GF_AUTH_ANONYMOUS_ENABLED, value: "true"}, {name: GF_AUTH_ANONYMOUS_ORG_ROLE, value: Admin}]
+          ports: [{containerPort: 3000}]
+          volumeMounts:
+            - {name: datasource, mountPath: /etc/grafana/provisioning/datasources}
+            - {name: dashboards, mountPath: /etc/grafana/provisioning/dashboards}
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards}
+          resources: {requests: {cpu: 100m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+      volumes:
+        - {name: datasource, configMap: {name: grafana-datasource}}
+        - {name: dashboards, configMap: {name: grafana-dashboard-provider}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: grafana, namespace: cloudpulse}
+spec: {selector: {app: grafana}, ports: [{port: 3000, targetPort: 3000}]}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: {name: cloudpulse-worker, namespace: cloudpulse}
+spec:
+  scaleTargetRef: {apiVersion: apps/v1, kind: Deployment, name: cloudpulse-worker}
+  minReplicas: 3
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource: {name: cpu, target: {type: Utilization, averageUtilization: 60}}
